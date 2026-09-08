@@ -700,7 +700,7 @@ public class JVectorWriter extends KnnVectorsWriter {
         // a number in [0.0, 1.0] that indicates how much leading segment live vectors dominate
         // over live vectors across all other segments, this is relevant when PQ is triggered since
         // only leading segment vectors will be taken into account
-        private static final double MAX_PQ_LEADING_SEGMENT_LIVE_VECTOR_FACTOR = 0.1;
+        private static final double MAX_PQ_OTHER_TO_LEADING_VECTOR_RATIO = 0.1;
 
         // Array of sub-readers
         private final KnnVectorsReader[] readers;
@@ -1082,9 +1082,10 @@ public class JVectorWriter extends KnnVectorsWriter {
             JVectorReader leadingReader = (JVectorReader) fieldsReader.getFieldReader(fieldName);
 
             final ProductQuantization leadingCompressor;
-            if (leadingReader.getProductQuantizationForField(fieldName).isEmpty() == false) {
+            final Optional<ProductQuantization> leadingCompressorOpt = leadingReader.getProductQuantizationForField(fieldName);
+            if (leadingCompressorOpt.isEmpty() == false) {
                 final long start = Clock.systemDefaultZone().millis();
-                leadingCompressor = leadingReader.getProductQuantizationForField(fieldName).get();
+                leadingCompressor = leadingCompressorOpt.get();
                 final long end = Clock.systemDefaultZone().millis();
                 final long trainingTime = end - start;
                 log.info("Refined PQ codebooks for field {}, in {} millis", fieldName, trainingTime);
@@ -1232,7 +1233,7 @@ public class JVectorWriter extends KnnVectorsWriter {
 
                     if (leadingCompressor != null) {
                         var leadingSegmentLiveVectorsFactor = totalLiveVectorsInOtherReaders / (double) totalLiveVectorsInLeadingReader;
-                        if (leadingSegmentLiveVectorsFactor > MAX_PQ_LEADING_SEGMENT_LIVE_VECTOR_FACTOR) {
+                        if (leadingSegmentLiveVectorsFactor > MAX_PQ_OTHER_TO_LEADING_VECTOR_RATIO) {
                             log.warn(
                                 "Leading segment does not contain sufficient live vectors to preserve the recall ({} / {}). "
                                     + "Will skip leading segment merge. (totalLiveVectors={})",
@@ -1271,6 +1272,10 @@ public class JVectorWriter extends KnnVectorsWriter {
                     // Note that this may NOT be the same as the "compact" ordinal space calculated earler,
                     // (although it is also compact)
                     var finalOrdToDocId = new int[totalLiveVectorsCount];
+                    // Maps each final (disk-compacted) ordinal back to the heap ordinal it came from.
+                    // Required so PQVectors can be encoded in final-ordinal space (size = totalLiveVectorsCount,
+                    // no holes) while still encoding the correct vector for each slot.
+                    var finalOrdToHeapOrd = new int[totalLiveVectorsCount];
 
                     int midOrd = 0;
                     int finalOrd = 0;
@@ -1284,6 +1289,7 @@ public class JVectorWriter extends KnnVectorsWriter {
                         // but by definition they match for the leading reader, so `.get(midOrd)` is valid
                         if (liveGraphNodesPerReader[LEADING_READER_IDX].get(midOrd)) {
                             finalOrdToDocId[finalOrd] = graphNodeIdToDocMap.getLuceneDocId(midOrd);
+                            finalOrdToHeapOrd[finalOrd] = heapOrd;
                             finalOrd++;
                         }
                         midOrd++;
@@ -1293,6 +1299,7 @@ public class JVectorWriter extends KnnVectorsWriter {
                         midToHeapOrds[midOrd] = heapOrd;
                         heapToGlobalRavvOrds[heapOrd] = graphNodeIdsToRavvOrds[midOrd];
                         finalOrdToDocId[finalOrd] = graphNodeIdToDocMap.getLuceneDocId(midOrd);
+                        finalOrdToHeapOrd[finalOrd] = heapOrd;
                         finalOrd++;
                         midOrd++;
                     }
@@ -1308,11 +1315,11 @@ public class JVectorWriter extends KnnVectorsWriter {
                         throw new IllegalStateException("failed to fill one of the maps, this is a bug");
                     }
 
-                    PQVectors compactPqVectors = null;
+                    PQVectors headPqVectors = null;
                     BuildScoreProvider leadingBsp = null;
                     var heapRavv = new RemappedRandomAccessVectorValues(this, heapToGlobalRavvOrds);
                     if (leadingCompressor != null) {
-                        compactPqVectors = PQVectors.encodeAndBuild(leadingCompressor, heapRavv.size(), new RandomAccessVectorValues() {
+                        headPqVectors = PQVectors.encodeAndBuild(leadingCompressor, heapRavv.size(), new RandomAccessVectorValues() {
                             @Override
                             public int size() {
                                 return heapRavv.size();
@@ -1344,7 +1351,7 @@ public class JVectorWriter extends KnnVectorsWriter {
                                 return heapRavv.copy();
                             }
                         }, simdPoolMerge);
-                        leadingBsp = BuildScoreProvider.pqBuildScoreProvider(getVectorSimilarityFunction(fieldInfo), compactPqVectors);
+                        leadingBsp = BuildScoreProvider.pqBuildScoreProvider(getVectorSimilarityFunction(fieldInfo), headPqVectors);
                     } else {
                         leadingBsp = BuildScoreProvider.randomAccessScoreProvider(heapRavv, getVectorSimilarityFunction(fieldInfo));
                     }
@@ -1394,7 +1401,18 @@ public class JVectorWriter extends KnnVectorsWriter {
                     // Note that the ordinals for the OnDiskGraphIndex will automatically be compacted
                     // But the OnHeapGraphIndex will not
                     var finalOrdToDocMap = new GraphNodeIdToDocMap(finalOrdToDocId);
-                    if (compactPqVectors != null) {
+                    if (headPqVectors != null) {
+                        // Build PQVectors in final-ordinal space (size = totalLiveVectorsCount, no holes == deleted vectors)
+                        // using the ordinalsMapping overload. Avoids re-encoding vectors from scratch while producing a blob
+                        // that is correctly indexed by the disk ordinals that OnDiskSequentialGraphIndexWriter assigns after
+                        // sequentialRenumbering (which compacts heap ordinals in the same order as finalOrdToHeapOrd).
+                        final PQVectors compactPqVectors = PQVectors.encodeAndBuild(
+                            leadingCompressor,
+                            totalLiveVectorsCount,
+                            ord -> finalOrdToHeapOrd[ord],
+                            heapRavv,
+                            simdPoolMerge
+                        );
                         writeField(fieldInfo, heapRavv, compactPqVectors, finalOrdToDocMap, graph);
                     } else {
                         writeField(fieldInfo, heapRavv, finalOrdToDocMap, graph);
