@@ -360,7 +360,7 @@ public class JVectorReader extends KnnVectorsReader {
 
         SearchScoreProvider buildScoreFunctionProvider(VectorFloat<?> q, OnDiskGraphIndex.View view) {
             if (fusedPqPresent) {
-                // FusedPQ is only written for the plain-PQ path (never alongside NVQ), so reranking always uses 
+                // FusedPQ is only written for the plain-PQ path (never alongside NVQ), so reranking always uses
                 // the graph's INLINE_VECTORS feature here.
                 ScoreFunction.ApproximateScoreFunction asf = view.approximateScoreFunctionFor(q, similarityFunction);
                 ScoreFunction.ExactScoreFunction reranker = wrapExactScoreFunction(
